@@ -1,181 +1,106 @@
-# GPT-Powered Lead Enrichment Agent with Google Sheet Dashboard (Improved Formatting Cleanup)
-
 import os
 import time
 import openai
-import requests
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 from dotenv import load_dotenv
+from gspread.exceptions import APIError
 
+# Load credentials
 load_dotenv()
-
-# --- API KEYS ---
-openai.api_key = os.getenv("OPENAI_API_KEY")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
-
-# --- Google Sheets Setup ---
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("/etc/secrets/google_creds.json", scope)
-client = gspread.authorize(creds)
+client = gspread.service_account(filename=os.getenv("GOOGLE_CREDENTIALS"))
 sheet = client.open_by_url(os.getenv("GOOGLE_SHEET_URL"))
 agent_tab = sheet.worksheet("Agent")
+dashboard_tab = sheet.worksheet("Dashboard")
 
-# --- Parameters ---
-START_ROW = 10
-MAX_ROWS = 25
+# Settings
+WRITE_DELAY = 3  # seconds between each row write
+MAX_RETRIES = 5
+SKIP_MARKER = "Manual search required"
+GENERIC_NAMES = ["john doe", "jon doe", "jane doe"]
+ENRICH_NOTE = "✅ Enriched via GPT"
 
-# --- Enrichment Function ---
-def enrich_lead(company_name):
-    print(f"\n🔍 Enriching: {company_name}")
-    serp_url = f"https://serpapi.com/search.json?q={company_name}+official+site&api_key={SERPAPI_KEY}"
-    serp_response = requests.get(serp_url).json()
-    urls = [r.get("link") for r in serp_response.get("organic_results", []) if r.get("link")]
-    if not urls:
-        return {"Website": "Manual search required"}
 
-    top_sites = "\n".join(urls[:3])
-
-    prompt = f"""
-    You are a smart research assistant. Analyze the websites below and extract details for the company:
-
-    Company Name: {company_name}
-    Websites:
-    {top_sites}
-
-    Return:
-    - Company Email
-    - Location
-    - Best Point of Contact (name + role)
-    - Email of POC
-    - Company LinkedIn
-    - Company Instagram
-    - Company Services
-    - Value Prop / Why a good fit for outdoor brand photographer
-    - Company Size (employees)
-    - Annual Revenue (if available)
-    - Lead Score (1-100)
-    """
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-    )
-    content = response["choices"][0]["message"]["content"]
-    return parse_gpt_response(content)
-
-# --- Parse GPT Output ---
-def parse_gpt_response(text):
-    fields = [
-        "Company Email", "Location", "Best Point of Contact", "Email of POC",
-        "Company LinkedIn", "Company Instagram", "Company Services",
-        "Value Prop", "Company Size", "Annual Revenue", "Lead Score"
-    ]
-    result = {}
-    for field in fields:
-        if field in text:
-            try:
-                val = text.split(f"{field}:")[1].split("\n")[0].strip()
-                result[field] = val if val else "Manual search required"
-            except:
-                result[field] = "Manual search required"
-        else:
-            result[field] = "Manual search required"
-    return result
-
-# --- Update Agent Sheet Row Efficiently ---
-def update_sheet_rows(batch_data, row_offset):
-    col_map = {
-        "Company Email": 2, "Location": 3, "Best Point of Contact": 4,
-        "Email of POC": 5, "Company LinkedIn": 6, "Company Instagram": 7,
-        "Company Services": 8, "Value Prop": 9, "Company Size": 10,
-        "Annual Revenue": 11, "Lead Score": 12
-    }
-    cell_updates = []
-    format_requests = []
-
-    for i, enrichment in enumerate(batch_data):
-        row_num = row_offset + i + 1
-        row_highlighted = False
-
-        for field, col in col_map.items():
-            value = enrichment.get(field, "Manual search required")
-            cell = gspread.utils.rowcol_to_a1(row_num, col)
-            cell_updates.append({'range': cell, 'values': [[value]]})
-
-            if value == "Manual search required" and not row_highlighted:
-                entire_row = f"A{row_num}:L{row_num}"
-                format_requests.append({
-                    'range': entire_row,
-                    'format': {"backgroundColor": {"red": 0.105, "green": 0.839, "blue": 0.576}}
-                })
-                row_highlighted = True
-            elif value != "Manual search required":
-                # Clear prior yellow formatting just in case
-                format_requests.append({
-                    'range': cell,
-                    'format': {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}
-                })
-
-    for update in cell_updates:
-        agent_tab.update(update['range'], update['values'])
-        time.sleep(0.5)
-    for fmt in format_requests:
-        agent_tab.format(fmt['range'], fmt['format'])
-        time.sleep(0.25)
-
-# --- Update Dashboard Tab ---
-def update_dashboard():
-    try:
-        dashboard = sheet.worksheet("Dashboard")
-    except:
-        dashboard = sheet.add_worksheet(title="Dashboard", rows="20", cols="6")
-
-    all_data = agent_tab.get_all_values()[1:]  # skip header
-    total = len(all_data)
-    enriched = sum(1 for row in all_data if any(val.strip() and val != "Manual search required" for val in row[1:]))
-    manual_count = sum(row.count("Manual search required") for row in all_data)
-
-    scores = []
-    for row in all_data:
+# === Utilities ===
+def safe_update(range_name, values):
+    retries = 0
+    while retries < MAX_RETRIES:
         try:
-            score = int(row[11])
-            scores.append(score)
-        except:
-            pass
+            agent_tab.update(range_name, values)
+            time.sleep(WRITE_DELAY)
+            return True
+        except APIError as e:
+            if "Quota exceeded" in str(e):
+                wait_time = 15 + (retries * 5)
+                print(f"Quota limit hit. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                retries += 1
+            else:
+                raise e
+    return False
 
-    avg_score = round(sum(scores)/len(scores), 1) if scores else "N/A"
-    high_score = sum(1 for s in scores if s >= 90)
-    mid_score = sum(1 for s in scores if 70 <= s < 90)
-    low_score = sum(1 for s in scores if s < 70)
 
-    dashboard.update("A1", [
-        ["Metric", "Value"],
-        ["Total Companies", total],
-        ["Leads Enriched", enriched],
-        ["Manual Search Required", manual_count],
-        ["Average Lead Score", avg_score],
-        ["Score 90+", high_score],
-        ["Score 70–89", mid_score],
-        ["Score < 70", low_score],
-    ])
+def row_needs_enrichment(row):
+    critical_columns = [1, 2, 4, 7, 8, 9, 10]  # B, C, E, H, I, J, K
+    for col in critical_columns:
+        if len(row) <= col:
+            return True
+        val = row[col].strip().lower()
+        if not val or val == SKIP_MARKER.lower() or any(name in val for name in GENERIC_NAMES):
+            return True
+    return False
 
-# --- Main Execution ---
+
+def update_progress(count, total):
+    try:
+        dashboard_tab.update("B2", f"Last Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        dashboard_tab.update("B3", f"{count} of {total} rows updated")
+    except Exception as e:
+        print(f"Failed to update dashboard: {e}")
+
+
+# === Core Enrichment Logic ===
+def enrich_row_data(company_name, website):
+    prompt = f"""
+You are helping a commercial photographer who specializes in outdoor lifestyle, headshot, and product photography. Based on the brand below, analyze whether they would be a good fit for a photography partnership.
+
+Brand: {company_name}
+Website: {website}
+
+Return the following:
+1. What does the brand do?
+2. Who is the best person to contact? (job title or name if possible — no placeholders like John Doe)
+3. Why would this brand benefit from working with this photographer?
+4. Assign a lead score (1-100) based on alignment with outdoor focus, visual storytelling needs, and growth potential.
+"""
+    response = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
+
+
+def parse_and_write(row_num, company_name, website):
+    enriched = enrich_row_data(company_name, website)
+    enriched += f"\n\n{ENRICH_NOTE} on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    target_range = f"D{row_num}"  # Example target column for enrichment output
+    safe_update(f"Agent!{target_range}", [[enriched]])
+
+
+# === Main ===
 def main():
-    all_data = agent_tab.get_all_values()
-    batch_enrichment = []
+    data = agent_tab.get_all_values()
+    header = data[0]
+    rows = data[1:]  # Skip header
 
-    for i in range(START_ROW - 1, min(len(all_data), START_ROW - 1 + MAX_ROWS)):
-        company_name = all_data[i][0]
-        if not company_name:
-            continue
-        enriched = enrich_lead(company_name)
-        batch_enrichment.append(enriched)
-        time.sleep(2.5)
+    total = len(rows)
+    enriched_count = 0
 
-    update_sheet_rows(batch_enrichment, START_ROW - 1)
-    update_dashboard()
+    for i, row in enumerate(rows):
+        row_num = i + 2
 
-if __name__ == "__main__":
-    main()
+        if row_needs_enrichment(row):
+            company_name = row[0] if len(row) > 0 else ""
+            website = row[7] if len(row) > 7 else ""
+            print(f"\n
