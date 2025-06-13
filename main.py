@@ -1,4 +1,4 @@
-# GPT-Powered Lead Enrichment Agent with Google Sheet Dashboard
+# GPT-Powered Lead Enrichment Agent with Google Sheet Dashboard (Improved Formatting Cleanup)
 
 import os
 import time
@@ -84,20 +84,46 @@ def parse_gpt_response(text):
             result[field] = "Manual search required"
     return result
 
-# --- Update Agent Sheet Row ---
-def update_sheet_row(row_num, data):
+# --- Update Agent Sheet Row Efficiently ---
+def update_sheet_rows(batch_data, row_offset):
     col_map = {
         "Company Email": 2, "Location": 3, "Best Point of Contact": 4,
         "Email of POC": 5, "Company LinkedIn": 6, "Company Instagram": 7,
         "Company Services": 8, "Value Prop": 9, "Company Size": 10,
         "Annual Revenue": 11, "Lead Score": 12
     }
-    for key, col in col_map.items():
-        current = agent_tab.cell(row_num, col).value
-        if current in ["", "Manual search required", None]:
-            agent_tab.update_cell(row_num, col, data.get(key, "Manual search required"))
-            if data.get(key) == "Manual search required":
-                agent_tab.format(gspread.utils.rowcol_to_a1(row_num, col), {"backgroundColor": {"red": 0.105, "green": 0.839, "blue": 0.576}})
+    cell_updates = []
+    format_requests = []
+
+    for i, enrichment in enumerate(batch_data):
+        row_num = row_offset + i + 1
+        row_highlighted = False
+
+        for field, col in col_map.items():
+            value = enrichment.get(field, "Manual search required")
+            cell = gspread.utils.rowcol_to_a1(row_num, col)
+            cell_updates.append({'range': cell, 'values': [[value]]})
+
+            if value == "Manual search required" and not row_highlighted:
+                entire_row = f"A{row_num}:L{row_num}"
+                format_requests.append({
+                    'range': entire_row,
+                    'format': {"backgroundColor": {"red": 0.105, "green": 0.839, "blue": 0.576}}
+                })
+                row_highlighted = True
+            elif value != "Manual search required":
+                # Clear prior yellow formatting just in case
+                format_requests.append({
+                    'range': cell,
+                    'format': {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}
+                })
+
+    for update in cell_updates:
+        agent_tab.update(update['range'], update['values'])
+        time.sleep(0.5)
+    for fmt in format_requests:
+        agent_tab.format(fmt['range'], fmt['format'])
+        time.sleep(0.25)
 
 # --- Update Dashboard Tab ---
 def update_dashboard():
@@ -137,15 +163,18 @@ def update_dashboard():
 
 # --- Main Execution ---
 def main():
-    data = agent_tab.get_all_values()
-    for i in range(START_ROW - 1, min(len(data), START_ROW - 1 + MAX_ROWS)):
-        company_name = data[i][0]
+    all_data = agent_tab.get_all_values()
+    batch_enrichment = []
+
+    for i in range(START_ROW - 1, min(len(all_data), START_ROW - 1 + MAX_ROWS)):
+        company_name = all_data[i][0]
         if not company_name:
             continue
-        enrichment = enrich_lead(company_name)
-        update_sheet_row(i + 1, enrichment)
-        time.sleep(1.5)
+        enriched = enrich_lead(company_name)
+        batch_enrichment.append(enriched)
+        time.sleep(2.5)
 
+    update_sheet_rows(batch_enrichment, START_ROW - 1)
     update_dashboard()
 
 if __name__ == "__main__":
