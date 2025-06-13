@@ -1,106 +1,104 @@
 import os
 import time
-import openai
+import re
 import gspread
-from datetime import datetime
+import openai
+import serpapi
 from dotenv import load_dotenv
+from datetime import datetime
 from gspread.exceptions import APIError
 
-# Load credentials
+# Load environment variables
 load_dotenv()
-client = gspread.service_account(filename=os.getenv("GOOGLE_CREDENTIALS"))
-sheet = client.open_by_url(os.getenv("GOOGLE_SHEET_URL"))
+
+SHEET_URL = os.getenv("GOOGLE_SHEET_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT") or "/etc/secrets/service_account.json"
+
+# Authenticate clients
+openai.api_key = OPENAI_API_KEY
+gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+sheet = gc.open_by_url(SHEET_URL)
 agent_tab = sheet.worksheet("Agent")
-dashboard_tab = sheet.worksheet("Dashboard")
+dashboard_tab = None
+try:
+    dashboard_tab = sheet.worksheet("Dashboard")
+except:
+    dashboard_tab = sheet.add_worksheet("Dashboard", rows=10, cols=2)
 
-# Settings
-WRITE_DELAY = 3  # seconds between each row write
+# Constants
+START_ROW = 10
 MAX_RETRIES = 5
-SKIP_MARKER = "Manual search required"
-GENERIC_NAMES = ["john doe", "jon doe", "jane doe"]
-ENRICH_NOTE = "✅ Enriched via GPT"
+RETRY_DELAY = 10  # seconds
 
+# Markers
+GENERIC_NAMES = ["john doe", "jon doe", "jane doe", "n/a"]
 
-# === Utilities ===
-def safe_update(range_name, values):
-    retries = 0
-    while retries < MAX_RETRIES:
-        try:
-            agent_tab.update(range_name, values)
-            time.sleep(WRITE_DELAY)
-            return True
-        except APIError as e:
-            if "Quota exceeded" in str(e):
-                wait_time = 15 + (retries * 5)
-                print(f"Quota limit hit. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                retries += 1
-            else:
-                raise e
+# Utilities
+def should_enrich(cell_value):
+    if not cell_value or cell_value.strip().lower() in ("manual search required", *GENERIC_NAMES):
+        return True
     return False
 
-
-def row_needs_enrichment(row):
-    critical_columns = [1, 2, 4, 7, 8, 9, 10]  # B, C, E, H, I, J, K
-    for col in critical_columns:
-        if len(row) <= col:
-            return True
-        val = row[col].strip().lower()
-        if not val or val == SKIP_MARKER.lower() or any(name in val for name in GENERIC_NAMES):
-            return True
-    return False
-
-
-def update_progress(count, total):
+def safe_update_cell(ws, row, col, value):
     try:
-        dashboard_tab.update("B2", f"Last Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        dashboard_tab.update("B3", f"{count} of {total} rows updated")
-    except Exception as e:
-        print(f"Failed to update dashboard: {e}")
+        ws.update_cell(row, col, value)
+    except APIError as e:
+        print(f"API Error on update_cell({row},{col}): {e}")
+        time.sleep(RETRY_DELAY)
+        ws.update_cell(row, col, value)
 
+def log_progress(text):
+    print(f"🔍 {text}")
+    dashboard_tab.update("B2", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    dashboard_tab.update("B3", text)
 
-# === Core Enrichment Logic ===
-def enrich_row_data(company_name, website):
-    prompt = f"""
-You are helping a commercial photographer who specializes in outdoor lifestyle, headshot, and product photography. Based on the brand below, analyze whether they would be a good fit for a photography partnership.
+# Enrichment
 
-Brand: {company_name}
-Website: {website}
+def enrich_row(row_num, row):
+    company = row[0]
+    log_progress(f"Enriching: {company}")
 
-Return the following:
-1. What does the brand do?
-2. Who is the best person to contact? (job title or name if possible — no placeholders like John Doe)
-3. Why would this brand benefit from working with this photographer?
-4. Assign a lead score (1-100) based on alignment with outdoor focus, visual storytelling needs, and growth potential.
-"""
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-    )
-    return response.choices[0].message.content
+    enriched_data = []
+    for i, value in enumerate(row):
+        if should_enrich(value):
+            prompt = f"Find accurate {agent_tab.row_values(1)[i]} for the brand '{company}' using the brand's website and digital footprint."
+            retries = 0
+            while retries < MAX_RETRIES:
+                try:
+                    completion = openai.ChatCompletion.create(
+                        model="gpt-4o",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.5,
+                    )
+                    enriched_value = completion.choices[0].message.content.strip()
+                    enriched_data.append((i + 1, enriched_value))
+                    break
+                except Exception as e:
+                    retries += 1
+                    print(f"Retry {retries}/{MAX_RETRIES} for {company}: {e}")
+                    time.sleep(RETRY_DELAY * retries)
+        else:
+            enriched_data.append((i + 1, value))
 
+    for col, new_val in enriched_data:
+        safe_update_cell(agent_tab, row_num, col, new_val)
 
-def parse_and_write(row_num, company_name, website):
-    enriched = enrich_row_data(company_name, website)
-    enriched += f"\n\n{ENRICH_NOTE} on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    target_range = f"D{row_num}"  # Example target column for enrichment output
-    safe_update(f"Agent!{target_range}", [[enriched]])
+    # Mark as enriched
+    status_col = 16
+    agent_tab.update_cell(row_num, status_col, f"✅ Enriched via GPT on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    time.sleep(1.5)  # rate limiting
 
+# Main
 
-# === Main ===
 def main():
-    data = agent_tab.get_all_values()
-    header = data[0]
-    rows = data[1:]  # Skip header
+    all_rows = agent_tab.get_all_values()[START_ROW - 1:]
+    for i, row in enumerate(all_rows):
+        if row[0]:
+            enrich_row(i + START_ROW, row)
 
-    total = len(rows)
-    enriched_count = 0
+    dashboard_tab.update("B2", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    dashboard_tab.update("B3", "✔️ Finished")
 
-    for i, row in enumerate(rows):
-        row_num = i + 2
-
-        if row_needs_enrichment(row):
-            company_name = row[0] if len(row) > 0 else ""
-            website = row[7] if len(row) > 7 else ""
-            print(f"\n
+if __name__ == '__main__':
+    main()
