@@ -16,7 +16,7 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 
 # --- Google Sheets Setup ---
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("google_creds.json", scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name("/etc/secrets/google_creds.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_url(os.getenv("GOOGLE_SHEET_URL")).worksheet("Agent")
 
@@ -111,7 +111,7 @@ def main():
             continue
         enrichment = enrich_lead(company_name)
         update_sheet_row(i + 1, enrichment)
-        print(f"✅ Finished row {i+1}")
+        time.sleep(1.5)  # Delay to prevent hitting API rate limits
 
 if __name__ == "__main__":
     main()
